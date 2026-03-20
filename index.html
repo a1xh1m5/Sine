@@ -980,21 +980,24 @@ function deepGet(obj, path){
 function mapTrack(raw){
   const cfg = loadCfg();
   const m   = cfg.map || {};
-  const rawArt = deepGet(raw, m.art || 'album.cover') || '';
+  // hifi-api wraps individual track objects in {version, data} on direct endpoints
+  // but search returns unwrapped items — handle both
+  const track = raw.data || raw;
+  const rawArt = deepGet(track, m.art || 'album.cover') || deepGet(raw, m.art || 'album.cover') || '';
   // Tidal returns cover art as a UUID — convert to full CDN URL
   const art = /^[0-9a-f-]{36}$/i.test(rawArt)
     ? 'https://resources.tidal.com/images/' + rawArt.replace(/-/g,'/') + '/320x320.jpg'
     : rawArt;
 
   return {
-    id:       deepGet(raw, m.id       || 'id'),
-    title:    deepGet(raw, m.title    || 'title')    || 'Unknown Title',
-    artist:   deepGet(raw, m.artist   || 'artist.name') || 'Unknown Artist',
-    album:    deepGet(raw, m.album    || 'album.title') || '',
-    duration: deepGet(raw, m.duration || 'duration') || 0,
+    id:       deepGet(track, m.id       || 'id'),
+    title:    deepGet(track, m.title    || 'title')    || 'Unknown Title',
+    artist:   deepGet(track, m.artist   || 'artist.name') || 'Unknown Artist',
+    album:    deepGet(track, m.album    || 'album.title') || '',
+    duration: deepGet(track, m.duration || 'duration') || 0,
     art,
-    quality:  deepGet(raw, m.quality  || 'audioQuality') || '',
-    streamUrl:deepGet(raw, m.stream   || '') || '',
+    quality:  deepGet(track, m.quality  || 'audioQuality') || '',
+    streamUrl:deepGet(track, m.stream   || '') || '',
     raw
   };
 }
@@ -1135,7 +1138,11 @@ async function getStreamURL(track){
   const data = await apiFetch(cfg.ep.stream, { id: track.id, country: cfg2.country||'US' });
   // Tidal API returns {url: "..."} or sometimes the URL directly as a string
   if(typeof data === 'string' && data.startsWith('http')) return data;
-  return data.url || data.streamUrl || data.urls?.[0] || data.stream || deepGet(data, cfg2.map?.stream||'url') || null;
+  // hifi-api stream response: {version, url} or {version, data: {url}} or {version, manifest}
+  const streamData = data.data || data;
+  return streamData.url || streamData.streamUrl || streamData.urls?.[0] || 
+         data.url || data.streamUrl || data.urls?.[0] ||
+         deepGet(data, cfg2.map?.stream||'url') || null;
 }
 
 async function playTrack(index, trackList){
@@ -1653,7 +1660,7 @@ function initApp(){
         lyrics: '/lyrics/{id}',
       },
       map:{
-        results:  'tracks.items',
+        results:  'data.tracks.items',
         id:       'id',
         title:    'title',
         artist:   'artist.name',
