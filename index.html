@@ -6,8 +6,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>SINE</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet"/>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap');
 
 :root {
 –bg:      #0a0a0a;
@@ -21,8 +23,8 @@
 –red:     #ff2d2d;
 –green:   #00ff87;
 –yellow:  #ffe600;
-–font-display: ‘Bebas Neue’, sans-serif;
-–font-mono:    ‘Space Mono’, monospace;
+–font-display: ‘Bebas Neue’, ‘Arial Black’, ‘Impact’, sans-serif;
+–font-mono:    ‘Space Mono’, ‘Courier New’, monospace;
 }
 
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -646,6 +648,12 @@ min-width:260px;
       <input class="s-input" id="sCfgCountry" placeholder="US" autocomplete="off" maxlength="4"/>
       <div class="s-hint">Some APIs require a country code for licensing. e.g. US, GB, AU</div>
     </div>
+
+    <div class="s-field">
+      <div class="s-label">CORS Proxy <span class="s-optional">if API blocks browser requests</span></div>
+      <input class="s-input" id="sCfgCorsProxy" placeholder="https://api.allorigins.win/raw?url=" autocomplete="off"/>
+      <div class="s-hint">Prepended to all API requests. Use if you get "Load failed" or CORS errors. Free option: https://api.allorigins.win/raw?url=  — leave blank if your API supports CORS natively.</div>
+    </div>
   </div>
 
   <div class="s-section">
@@ -902,13 +910,59 @@ function buildURL(base, template, vars={}){
   return url;
 }
 
+const TIDAL_INSTANCES = [
+  'https://hifi-one.spotisaver.net',
+  'https://hifi-two.spotisaver.net',
+  'https://streamex.sh/api/music',
+  'https://hifi.p1nkhamster.xyz',
+  'https://tidal-api.binimum.org',
+  'https://us-west.monochrome.tf',
+  'https://eu-central.monochrome.tf',
+  'https://triton.squid.wtf',
+];
+
+function proxyWrap(url, cfg){
+  if(!cfg.corsProxy) return url;
+  const proxy = cfg.corsProxy.trim();
+  // If proxy ends with = or ?, append the URL (some want encoded, some don't)
+  // allorigins style (?url=) works best with the raw URL appended
+  if(proxy.endsWith('=') || proxy.endsWith('?')){
+    return proxy + encodeURIComponent(url);
+  }
+  // Slash-style proxy: proxy/https://...
+  return proxy.replace(/\/+$/, '') + '/' + encodeURIComponent(url);
+}
+
 async function apiFetch(endpoint, vars={}){
   const cfg = loadCfg();
   if(!cfg.base) throw new Error('No API base URL configured');
-  const url = buildURL(cfg.base, endpoint, { country: cfg.country||'US', ...vars });
-  const res = await fetch(url, { headers: buildHeaders(cfg) });
-  if(!res.ok) throw new Error(`API ${res.status}: ${res.statusText}`);
-  return res.json();
+
+  // Try configured base first, then auto-failover through known instances
+  const bases = [cfg.base, ...TIDAL_INSTANCES.filter(b => b !== cfg.base)];
+
+  for(const base of bases){
+    try{
+      let url = buildURL(base, endpoint, { country: cfg.country||'US', ...vars });
+      url = proxyWrap(url, cfg);
+      console.log('[SINE] Fetching:', url);
+      const res = await fetch(url, { headers: buildHeaders(cfg) });
+      if(!res.ok) continue; // try next instance
+      const data = await res.json();
+      // If this instance worked and it's not the configured one, update config
+      if(base !== cfg.base){
+        console.log('[SINE] Switched to instance:', base);
+        cfg.base = base;
+        saveCfg(cfg);
+        loadSettingsUI();
+        setStatus('Switched to: ' + base.replace('https://',''), 'live');
+      }
+      return data;
+    } catch(e){
+      console.warn('[SINE] Instance failed:', base, e.message);
+      // try next
+    }
+  }
+  throw new Error('All API instances failed');
 }
 
 // Deep-get a value from an object using dot notation e.g. "album.cover"
@@ -926,13 +980,19 @@ function deepGet(obj, path){
 function mapTrack(raw){
   const cfg = loadCfg();
   const m   = cfg.map || {};
+  const rawArt = deepGet(raw, m.art || 'album.cover') || '';
+  // Tidal returns cover art as a UUID — convert to full CDN URL
+  const art = /^[0-9a-f-]{36}$/i.test(rawArt)
+    ? 'https://resources.tidal.com/images/' + rawArt.replace(/-/g,'/') + '/320x320.jpg'
+    : rawArt;
+
   return {
     id:       deepGet(raw, m.id       || 'id'),
     title:    deepGet(raw, m.title    || 'title')    || 'Unknown Title',
     artist:   deepGet(raw, m.artist   || 'artist.name') || 'Unknown Artist',
     album:    deepGet(raw, m.album    || 'album.title') || '',
     duration: deepGet(raw, m.duration || 'duration') || 0,
-    art:      deepGet(raw, m.art      || 'album.cover') || '',
+    art,
     quality:  deepGet(raw, m.quality  || 'audioQuality') || '',
     streamUrl:deepGet(raw, m.stream   || '') || '',
     raw
@@ -1071,9 +1131,11 @@ async function getStreamURL(track){
   const cfg = loadCfg();
   if(!cfg.ep?.stream) throw new Error('No stream endpoint configured');
 
-  const data = await apiFetch(cfg.ep.stream, { id: track.id });
-  // Try common locations
-  return data.url || data.streamUrl || data.urls?.[0] || deepGet(data, cfg.map?.stream||'url') || null;
+  const cfg2 = loadCfg();
+  const data = await apiFetch(cfg.ep.stream, { id: track.id, country: cfg2.country||'US' });
+  // Tidal API returns {url: "..."} or sometimes the URL directly as a string
+  if(typeof data === 'string' && data.startsWith('http')) return data;
+  return data.url || data.streamUrl || data.urls?.[0] || data.stream || deepGet(data, cfg2.map?.stream||'url') || null;
 }
 
 async function playTrack(index, trackList){
@@ -1161,8 +1223,12 @@ async function fetchAndShowLyrics(track){
   try{
     if(cfg.ep?.lyrics){
       // Fetch raw — response might be TTML (XML), LRC (plain text), or JSON
-      const url=buildURL(cfg.base, cfg.ep.lyrics, { id:track.id, country:cfg.country||'US' });
-      const res=await fetch(url,{headers:buildHeaders(cfg)});
+      let lrcUrl=buildURL(cfg.base, cfg.ep.lyrics, { id:track.id, country:cfg.country||'US' });
+      if(cfg.corsProxy){
+        const proxy=cfg.corsProxy.trim().replace(/\/+$/,'');
+        lrcUrl=proxy.endsWith('?')?proxy+encodeURIComponent(lrcUrl):proxy+'/'+encodeURIComponent(lrcUrl);
+      }
+      const res=await fetch(lrcUrl,{headers:buildHeaders(cfg)});
       if(res.ok){
         const contentType=res.headers.get('content-type')||'';
         let raw='';
@@ -1428,6 +1494,7 @@ function loadSettingsUI(){
   el('sCfgAuthExtra').value  = cfg.authExtra||'';
   el('sCfgBasicPass').value  = cfg.basicPass||'';
   el('sCfgCountry').value    = cfg.country||'';
+  el('sCfgCorsProxy').value  = cfg.corsProxy||'';
   el('sEpSearch').value      = cfg.ep?.search||'';
   el('sEpStream').value      = cfg.ep?.stream||'';
   el('sEpTrack').value       = cfg.ep?.track||'';
@@ -1469,6 +1536,7 @@ document.getElementById('sSaveBtn').addEventListener('click',()=>{
     authExtra:el('sCfgAuthExtra'),
     basicPass:el('sCfgBasicPass'),
     country:  el('sCfgCountry'),
+    corsProxy:el('sCfgCorsProxy'),
     ep:{
       search: el('sEpSearch'),
       stream: el('sEpStream'),
@@ -1501,7 +1569,12 @@ document.getElementById('sTestBtn').addEventListener('click',async()=>{
   setFeedback('sSettingsFeedback','Testing…','');
   try{
     // Just hit the base URL to see if it responds
-    const res=await fetch(cfg.base.replace(/\/+$/,''), { headers:buildHeaders(cfg) });
+    let testUrl=cfg.base.replace(/\/+$/,'');
+    if(cfg.corsProxy){
+      const proxy=cfg.corsProxy.trim().replace(/\/+$/,'');
+      testUrl=proxy.endsWith('?')?proxy+encodeURIComponent(testUrl):proxy+'/'+encodeURIComponent(testUrl);
+    }
+    const res=await fetch(testUrl, { headers:buildHeaders(cfg) });
     setFeedback('sSettingsFeedback',`Response: ${res.status} ${res.statusText}`,'ok');
     setDot('live');
   } catch(e){
@@ -1556,6 +1629,45 @@ document.addEventListener('keydown',e=>{
 function initApp(){
   if(appInited) return;
   appInited=true;
+
+  // Pre-fill Tidal API config if nothing saved yet
+  const existing = loadCfg();
+  // Force-update proxy if still on the old corsproxy.io value
+  if(existing.corsProxy && existing.corsProxy.includes('corsproxy.io')){
+    existing.corsProxy = 'https://api.allorigins.win/raw?url=';
+    saveCfg(existing);
+  }
+  if(!existing.base){
+    const defaults = {
+      base:      'https://hifi-one.spotisaver.net',
+      authType:  'none',
+      token:     '',
+      country:   'US',
+      corsProxy: 'https://api.allorigins.win/raw?url=',
+      ep:{
+        search: '/search?query={query}&limit=25&offset=0',
+        stream: '/stream/{id}',
+        track:  '/track/{id}',
+        album:  '/album/{id}',
+        artist: '/artist/{id}',
+        lyrics: '/lyrics/{id}',
+      },
+      map:{
+        results:  'tracks.items',
+        id:       'id',
+        title:    'title',
+        artist:   'artist.name',
+        album:    'album.title',
+        duration: 'duration',
+        art:      'album.cover',
+        quality:  'audioQuality',
+        stream:   '',
+        lyrics:   'lyrics',
+      }
+    };
+    saveCfg(defaults);
+  }
+
   loadSettingsUI();
   renderLibrary();
   updateStatusFromCfg(loadCfg());
